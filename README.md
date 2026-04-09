@@ -107,8 +107,3 @@ Latest local verification completed with:
 cargo test --workspace
 ```
 
-## Notes
-
-- The repository is now Rust-only in its active code paths.
-- `replit.md` still contains older project history and may not reflect the latest Rust-only layout.
-- If you want a UI again, a new frontend needs to be added separately.
