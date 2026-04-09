@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { useWallet, useConnection } from "@solana/wallet-adapter-react";
 import {
   PublicKey,
@@ -9,14 +9,41 @@ import {
 import { EscrowAccount, EscrowStatus } from "@/types/escrow";
 
 const PROGRAM_ID = new PublicKey("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
+const API_BASE = "/api";
 
 function getEscrowPDA(buyer: PublicKey, escrowId: number): [PublicKey, number] {
-  const escrowIdBuf = Buffer.alloc(8);
-  escrowIdBuf.writeBigUInt64LE(BigInt(escrowId));
+  const escrowIdBuf = new Uint8Array(8);
+  const view = new DataView(escrowIdBuf.buffer);
+  view.setBigUint64(0, BigInt(escrowId), true);
   return PublicKey.findProgramAddressSync(
     [Buffer.from("escrow"), buyer.toBuffer(), escrowIdBuf],
     PROGRAM_ID
   );
+}
+
+interface ApiEscrow {
+  id: string;
+  buyer: string;
+  seller: string;
+  amount: number;
+  amount_sol: number;
+  status: string;
+  escrow_id: number;
+  pda: string;
+  created_at: string;
+}
+
+function fromApi(e: ApiEscrow): EscrowAccount {
+  return {
+    id: e.id,
+    pda: new PublicKey(e.pda),
+    buyer: new PublicKey(e.buyer),
+    seller: new PublicKey(e.seller),
+    amount: e.amount,
+    amountInSol: e.amount_sol,
+    status: e.status as EscrowStatus,
+    escrowId: e.escrow_id,
+  };
 }
 
 export function useEscrow() {
@@ -26,6 +53,30 @@ export function useEscrow() {
   const [escrows, setEscrows] = useState<EscrowAccount[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Load existing escrows from Rust backend whenever wallet connects
+  useEffect(() => {
+    if (!publicKey) {
+      setEscrows([]);
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    fetch(`${API_BASE}/escrows?buyer=${publicKey.toBase58()}`)
+      .then((r) => r.json())
+      .then((res: { success: boolean; data?: ApiEscrow[] }) => {
+        if (!cancelled && res.success && res.data) {
+          setEscrows(res.data.map(fromApi));
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setError("Could not load escrows from server.");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [publicKey]);
 
   const addEscrow = useCallback(
     async (sellerAddress: string, amountSol: number) => {
@@ -47,9 +98,10 @@ export function useEscrow() {
         if (amountSol <= 0) throw new Error("Amount must be greater than 0 SOL.");
 
         const escrowId = Date.now();
-        const [escrowPDA, bump] = getEscrowPDA(publicKey, escrowId);
+        const [escrowPDA] = getEscrowPDA(publicKey, escrowId);
         const lamports = Math.floor(amountSol * LAMPORTS_PER_SOL);
 
+        // Build and send SOL transfer transaction to lock funds in PDA
         const tx = new Transaction().add(
           SystemProgram.transfer({
             fromPubkey: publicKey,
@@ -65,17 +117,27 @@ export function useEscrow() {
         const sig = await sendTransaction(tx, connection);
         await connection.confirmTransaction(sig, "confirmed");
 
-        const newEscrow: EscrowAccount = {
-          id: sig,
-          pda: escrowPDA,
-          buyer: publicKey,
-          seller: sellerPubkey,
-          amount: lamports,
-          amountInSol: amountSol,
-          status: EscrowStatus.Pending,
-          escrowId,
-        };
+        // Persist escrow record in Rust backend
+        const res = await fetch(`${API_BASE}/escrows`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            id: sig,
+            buyer: publicKey.toBase58(),
+            seller: sellerPubkey.toBase58(),
+            amount: lamports,
+            amount_sol: amountSol,
+            escrow_id: escrowId,
+            pda: escrowPDA.toBase58(),
+          }),
+        });
 
+        const json = await res.json() as { success: boolean; data?: ApiEscrow; message?: string };
+        if (!json.success || !json.data) {
+          throw new Error(json.message || "Failed to save escrow to server.");
+        }
+
+        const newEscrow = fromApi(json.data);
         setEscrows((prev) => [newEscrow, ...prev]);
         return newEscrow;
       } catch (err: unknown) {
@@ -107,16 +169,7 @@ export function useEscrow() {
       setError(null);
 
       try {
-        const balance = await connection.getBalance(escrow.pda);
-        if (balance === 0) {
-          setEscrows((prev) =>
-            prev.map((e) =>
-              e.id === escrow.id ? { ...e, status: EscrowStatus.Completed } : e
-            )
-          );
-          return true;
-        }
-
+        // Transfer SOL to seller
         const tx = new Transaction().add(
           SystemProgram.transfer({
             fromPubkey: publicKey,
@@ -129,8 +182,15 @@ export function useEscrow() {
         const { blockhash } = await connection.getLatestBlockhash();
         tx.recentBlockhash = blockhash;
 
-        const sig = await sendTransaction(tx, connection);
-        await connection.confirmTransaction(sig, "confirmed");
+        await sendTransaction(tx, connection);
+
+        // Update status in Rust backend
+        const res = await fetch(`${API_BASE}/escrows/${escrow.id}/release`, {
+          method: "PATCH",
+        });
+        const json = await res.json() as { success: boolean; data?: ApiEscrow; message?: string };
+
+        if (!json.success) throw new Error(json.message || "Failed to update status.");
 
         setEscrows((prev) =>
           prev.map((e) =>
@@ -167,6 +227,14 @@ export function useEscrow() {
       setError(null);
 
       try {
+        // Update status in Rust backend
+        const res = await fetch(`${API_BASE}/escrows/${escrow.id}/cancel`, {
+          method: "PATCH",
+        });
+        const json = await res.json() as { success: boolean; data?: ApiEscrow; message?: string };
+
+        if (!json.success) throw new Error(json.message || "Failed to update status.");
+
         setEscrows((prev) =>
           prev.map((e) =>
             e.id === escrow.id ? { ...e, status: EscrowStatus.Cancelled } : e
